@@ -17,6 +17,7 @@ limitations under the License.
 package cpumanager
 
 import (
+	"context"
 	"k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/kubelet/cm/containermap"
@@ -42,7 +43,7 @@ func (m *fakeManager) Policy() Policy {
 	return pol
 }
 
-func (m *fakeManager) Allocate(pod *v1.Pod, container *v1.Container) error {
+func (m *fakeManager) Allocate(_ context.Context, pod *v1.Pod, container *v1.Container) error {
 	klog.InfoS("Allocate", "pod", klog.KObj(pod), "containerName", container.Name)
 	return nil
 }

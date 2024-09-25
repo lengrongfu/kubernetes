@@ -1948,7 +1948,7 @@ func (kl *Kubelet) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType
 		// TODO(vinaykul,InPlacePodVerticalScaling): Investigate doing this in HandlePodUpdates + periodic SyncLoop scan
 		//     See: https://github.com/kubernetes/kubernetes/pull/102884#discussion_r663160060
 		if kl.podWorkers.CouldHaveRunningContainers(pod.UID) && !kubetypes.IsStaticPod(pod) {
-			pod = kl.handlePodResourcesResize(pod)
+			pod = kl.handlePodResourcesResize(ctx, pod)
 		}
 	}
 
@@ -2285,7 +2285,7 @@ func (kl *Kubelet) rejectPod(pod *v1.Pod, reason, message string) {
 // The function returns a boolean value indicating whether the pod
 // can be admitted, a brief single-word reason and a message explaining why
 // the pod cannot be admitted.
-func (kl *Kubelet) canAdmitPod(pods []*v1.Pod, pod *v1.Pod) (bool, string, string) {
+func (kl *Kubelet) canAdmitPod(ctx context.Context, pods []*v1.Pod, pod *v1.Pod) (bool, string, string) {
 	// the kubelet will invoke each pod admit handler in sequence
 	// if any handler rejects, the pod is rejected.
 	// TODO: move out of disk check into a pod admitter
@@ -2303,7 +2303,7 @@ func (kl *Kubelet) canAdmitPod(pods []*v1.Pod, pod *v1.Pod) (bool, string, strin
 		attrs.OtherPods = otherPods
 	}
 	for _, podAdmitHandler := range kl.admitHandlers {
-		if result := podAdmitHandler.Admit(attrs); !result.Admit {
+		if result := podAdmitHandler.Admit(ctx, attrs); !result.Admit {
 
 			klog.InfoS("Pod admission denied", "podUID", attrs.Pod.UID, "pod", klog.KObj(attrs.Pod), "reason", result.Reason, "message", result.Message)
 
@@ -2541,6 +2541,13 @@ func (kl *Kubelet) HandlePodAdditions(pods []*v1.Pod) {
 		defer kl.podResizeMutex.Unlock()
 	}
 	for _, pod := range pods {
+		ctx, otelSpan := kl.tracer.Start(context.Background(), "HandlePodAdditions", trace.WithAttributes(
+			semconv.K8SPodUIDKey.String(string(pod.UID)),
+			attribute.String("k8s.pod", klog.KObj(pod).String()),
+			semconv.K8SPodNameKey.String(pod.Name),
+			semconv.K8SNamespaceNameKey.String(pod.Namespace),
+		))
+
 		existingPods := kl.podManager.GetPods()
 		// Always add the pod to the pod manager. Kubelet relies on the pod
 		// manager as the source of truth for the desired state. If a pod does
@@ -2582,7 +2589,7 @@ func (kl *Kubelet) HandlePodAdditions(pods []*v1.Pod) {
 				kl.updateContainerResourceAllocation(podCopy)
 
 				// Check if we can admit the pod; if not, reject it.
-				if ok, reason, message := kl.canAdmitPod(activePods, podCopy); !ok {
+				if ok, reason, message := kl.canAdmitPod(ctx, activePods, podCopy); !ok {
 					kl.rejectPod(pod, reason, message)
 					continue
 				}
@@ -2593,7 +2600,7 @@ func (kl *Kubelet) HandlePodAdditions(pods []*v1.Pod) {
 				}
 			} else {
 				// Check if we can admit the pod; if not, reject it.
-				if ok, reason, message := kl.canAdmitPod(activePods, pod); !ok {
+				if ok, reason, message := kl.canAdmitPod(ctx, activePods, pod); !ok {
 					kl.rejectPod(pod, reason, message)
 					continue
 				}
@@ -2605,6 +2612,7 @@ func (kl *Kubelet) HandlePodAdditions(pods []*v1.Pod) {
 			UpdateType: kubetypes.SyncPodCreate,
 			StartTime:  start,
 		})
+		otelSpan.End()
 	}
 }
 
@@ -2767,7 +2775,7 @@ func isPodResizeInProgress(pod *v1.Pod, podStatus *v1.PodStatus) bool {
 	return false
 }
 
-func (kl *Kubelet) canResizePod(pod *v1.Pod) (bool, *v1.Pod, v1.PodResizeStatus) {
+func (kl *Kubelet) canResizePod(ctx context.Context, pod *v1.Pod) (bool, *v1.Pod, v1.PodResizeStatus) {
 	var otherActivePods []*v1.Pod
 
 	node, err := kl.getNodeAnyWay()
@@ -2794,7 +2802,7 @@ func (kl *Kubelet) canResizePod(pod *v1.Pod) (bool, *v1.Pod, v1.PodResizeStatus)
 		}
 	}
 
-	if ok, failReason, failMessage := kl.canAdmitPod(otherActivePods, podCopy); !ok {
+	if ok, failReason, failMessage := kl.canAdmitPod(ctx, otherActivePods, podCopy); !ok {
 		// Log reason and return. Let the next sync iteration retry the resize
 		klog.V(3).InfoS("Resize cannot be accommodated", "pod", podCopy.Name, "reason", failReason, "message", failMessage)
 		return false, podCopy, v1.PodResizeStatusDeferred
@@ -2811,7 +2819,7 @@ func (kl *Kubelet) canResizePod(pod *v1.Pod) (bool, *v1.Pod, v1.PodResizeStatus)
 	return true, podCopy, v1.PodResizeStatusInProgress
 }
 
-func (kl *Kubelet) handlePodResourcesResize(pod *v1.Pod) *v1.Pod {
+func (kl *Kubelet) handlePodResourcesResize(ctx context.Context, pod *v1.Pod) *v1.Pod {
 	if pod.Status.Phase != v1.PodRunning {
 		return pod
 	}
@@ -2840,7 +2848,7 @@ func (kl *Kubelet) handlePodResourcesResize(pod *v1.Pod) *v1.Pod {
 
 	kl.podResizeMutex.Lock()
 	defer kl.podResizeMutex.Unlock()
-	fit, updatedPod, resizeStatus := kl.canResizePod(pod)
+	fit, updatedPod, resizeStatus := kl.canResizePod(ctx, pod)
 	if updatedPod == nil {
 		return pod
 	}

@@ -19,6 +19,8 @@ package devicemanager
 import (
 	"context"
 	"fmt"
+	"go.opentelemetry.io/otel/baggage"
+	"k8s.io/klog/v2"
 	"sync"
 	"time"
 
@@ -30,9 +32,9 @@ import (
 // for managing gRPC communications with the device plugin and caching
 // device states reported by the device plugin.
 type endpoint interface {
-	getPreferredAllocation(available, mustInclude []string, size int) (*pluginapi.PreferredAllocationResponse, error)
-	allocate(devs []string) (*pluginapi.AllocateResponse, error)
-	preStartContainer(devs []string) (*pluginapi.PreStartContainerResponse, error)
+	getPreferredAllocation(ctx context.Context, available, mustInclude []string, size int) (*pluginapi.PreferredAllocationResponse, error)
+	allocate(ctx context.Context, devs []string) (*pluginapi.AllocateResponse, error)
+	preStartContainer(ctx context.Context, devs []string) (*pluginapi.PreStartContainerResponse, error)
 	setStopTime(t time.Time)
 	isStopped() bool
 	stopGracePeriodExpired() bool
@@ -83,11 +85,11 @@ func (e *endpointImpl) setStopTime(t time.Time) {
 }
 
 // getPreferredAllocation issues GetPreferredAllocation gRPC call to the device plugin.
-func (e *endpointImpl) getPreferredAllocation(available, mustInclude []string, size int) (*pluginapi.PreferredAllocationResponse, error) {
+func (e *endpointImpl) getPreferredAllocation(ctx context.Context, available, mustInclude []string, size int) (*pluginapi.PreferredAllocationResponse, error) {
 	if e.isStopped() {
 		return nil, fmt.Errorf(errEndpointStopped, e)
 	}
-	return e.api.GetPreferredAllocation(context.Background(), &pluginapi.PreferredAllocationRequest{
+	return e.api.GetPreferredAllocation(ctx, &pluginapi.PreferredAllocationRequest{
 		ContainerRequests: []*pluginapi.ContainerPreferredAllocationRequest{
 			{
 				AvailableDeviceIDs:   available,
@@ -99,11 +101,14 @@ func (e *endpointImpl) getPreferredAllocation(available, mustInclude []string, s
 }
 
 // allocate issues Allocate gRPC call to the device plugin.
-func (e *endpointImpl) allocate(devs []string) (*pluginapi.AllocateResponse, error) {
+func (e *endpointImpl) allocate(ctx context.Context, devs []string) (*pluginapi.AllocateResponse, error) {
 	if e.isStopped() {
 		return nil, fmt.Errorf(errEndpointStopped, e)
 	}
-	return e.api.Allocate(context.Background(), &pluginapi.AllocateRequest{
+	bag := baggage.FromContext(ctx)
+	// 打印 Baggage 信息
+	klog.Infof("Received baggage: %s", bag.String())
+	return e.api.Allocate(ctx, &pluginapi.AllocateRequest{
 		ContainerRequests: []*pluginapi.ContainerAllocateRequest{
 			{DevicesIDs: devs},
 		},
@@ -111,11 +116,11 @@ func (e *endpointImpl) allocate(devs []string) (*pluginapi.AllocateResponse, err
 }
 
 // preStartContainer issues PreStartContainer gRPC call to the device plugin.
-func (e *endpointImpl) preStartContainer(devs []string) (*pluginapi.PreStartContainerResponse, error) {
+func (e *endpointImpl) preStartContainer(ctx context.Context, devs []string) (*pluginapi.PreStartContainerResponse, error) {
 	if e.isStopped() {
 		return nil, fmt.Errorf(errEndpointStopped, e)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), pluginapi.KubeletPreStartContainerRPCTimeoutInSecs*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, pluginapi.KubeletPreStartContainerRPCTimeoutInSecs*time.Second)
 	defer cancel()
 	return e.api.PreStartContainer(ctx, &pluginapi.PreStartContainerRequest{
 		DevicesIDs: devs,

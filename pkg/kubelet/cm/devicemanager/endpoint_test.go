@@ -17,6 +17,7 @@ limitations under the License.
 package devicemanager
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -195,7 +196,7 @@ func TestAllocate(t *testing.T) {
 		t.FailNow()
 	}
 
-	respOut, err := e.allocate([]string{"ADeviceId"})
+	respOut, err := e.allocate(context.Background(), []string{"ADeviceId"})
 	require.NoError(t, err)
 	require.Equal(t, resp, respOut)
 }
@@ -229,7 +230,7 @@ func TestGetPreferredAllocation(t *testing.T) {
 		t.FailNow()
 	}
 
-	respOut, err := e.getPreferredAllocation([]string{}, []string{}, -1)
+	respOut, err := e.getPreferredAllocation(context.Background(), []string{}, []string{}, -1)
 	require.NoError(t, err)
 	require.Equal(t, resp, respOut)
 }

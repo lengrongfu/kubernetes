@@ -19,12 +19,13 @@ package v1beta1
 import (
 	"context"
 	"fmt"
-	"net"
-	"sync"
-	"time"
-
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"k8s.io/component-base/tracing"
+	"net"
+	"sync"
 
 	"k8s.io/klog/v2"
 	api "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
@@ -51,20 +52,22 @@ type client struct {
 	grpc     *grpc.ClientConn
 	handler  ClientHandler
 	client   api.DevicePluginClient
+	tp       trace.TracerProvider
 }
 
 // NewPluginClient returns an initialized device plugin client.
-func NewPluginClient(r string, socketPath string, h ClientHandler) Client {
+func NewPluginClient(r string, socketPath string, h ClientHandler, tp trace.TracerProvider) Client {
 	return &client{
 		resource: r,
 		socket:   socketPath,
 		handler:  h,
+		tp:       tp,
 	}
 }
 
 // Connect is for establishing a gRPC connection between device manager and device plugin.
 func (c *client) Connect() error {
-	client, conn, err := dial(c.socket)
+	client, conn, err := dial(c.socket, c.tp)
 	if err != nil {
 		klog.ErrorS(err, "Unable to connect to device plugin client with socket path", "path", c.socket)
 		return err
@@ -122,18 +125,29 @@ func (c *client) SocketPath() string {
 }
 
 // dial establishes the gRPC communication with the registered device plugin. https://godoc.org/google.golang.org/grpc#Dial
-func dial(unixSocketPath string) (api.DevicePluginClient, *grpc.ClientConn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	c, err := grpc.DialContext(ctx, unixSocketPath,
+func dial(unixSocketPath string, tp trace.TracerProvider) (api.DevicePluginClient, *grpc.ClientConn, error) {
+	//ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	//defer cancel()
+	var dialOpts []grpc.DialOption
+	dialOpts = append(dialOpts,
 		grpc.WithAuthority("localhost"),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
 		grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", addr)
-		}),
-	)
+		}))
+	if tp != nil {
+		tracingOpts := []otelgrpc.Option{
+			otelgrpc.WithMessageEvents(otelgrpc.ReceivedEvents, otelgrpc.SentEvents),
+			otelgrpc.WithPropagators(tracing.Propagators()),
+			otelgrpc.WithTracerProvider(tp),
+		}
+		dialOpts = append(dialOpts,
+			grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+			grpc.WithUnaryInterceptor(otelgrpc.UnaryClientInterceptor(tracingOpts...)),
+			grpc.WithStreamInterceptor(otelgrpc.StreamClientInterceptor(tracingOpts...)))
+	}
+	c, err := grpc.NewClient(unixSocketPath, dialOpts...)
 
 	if err != nil {
 		return nil, nil, fmt.Errorf(errFailedToDialDevicePlugin+" %v", err)

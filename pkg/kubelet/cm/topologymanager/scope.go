@@ -17,6 +17,8 @@ limitations under the License.
 package topologymanager
 
 import (
+	"context"
+	"go.opentelemetry.io/otel/baggage"
 	"sync"
 
 	"k8s.io/api/core/v1"
@@ -41,7 +43,7 @@ type podTopologyHints map[string]map[string]TopologyHint
 type Scope interface {
 	Name() string
 	GetPolicy() Policy
-	Admit(pod *v1.Pod) lifecycle.PodAdmitResult
+	Admit(ctx context.Context, pod *v1.Pod) lifecycle.PodAdmitResult
 	// AddHintProvider adds a hint provider to manager to indicate the hint provider
 	// wants to be consoluted with when making topology hints
 	AddHintProvider(h HintProvider)
@@ -135,9 +137,9 @@ func (s *scope) RemoveContainer(containerID string) error {
 	return nil
 }
 
-func (s *scope) admitPolicyNone(pod *v1.Pod) lifecycle.PodAdmitResult {
+func (s *scope) admitPolicyNone(ctx context.Context, pod *v1.Pod) lifecycle.PodAdmitResult {
 	for _, container := range append(pod.Spec.InitContainers, pod.Spec.Containers...) {
-		err := s.allocateAlignedResources(pod, &container)
+		err := s.allocateAlignedResources(ctx, pod, &container)
 		if err != nil {
 			return admission.GetPodAdmitResult(err)
 		}
@@ -147,12 +149,44 @@ func (s *scope) admitPolicyNone(pod *v1.Pod) lifecycle.PodAdmitResult {
 
 // It would be better to implement this function in topologymanager instead of scope
 // but topologymanager do not track providers anymore
-func (s *scope) allocateAlignedResources(pod *v1.Pod, container *v1.Container) error {
+func (s *scope) allocateAlignedResources(ctx context.Context, pod *v1.Pod, container *v1.Container) error {
+	bag := s.generateBaggage(pod, container)
+	klog.V(2).InfoS("generate baggage info is: %s", bag.String())
+	ctx = baggage.ContextWithBaggage(ctx, bag)
 	for _, provider := range s.hintProviders {
-		err := provider.Allocate(pod, container)
+		err := provider.Allocate(ctx, pod, container)
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (s *scope) generateBaggage(pod *v1.Pod, container *v1.Container) baggage.Baggage {
+	podUID, err := baggage.NewMember("pod.uid", string(pod.UID))
+	if err != nil {
+		klog.V(2).ErrorS(err, "new pod.uid member error")
+		return baggage.Baggage{}
+	}
+	podName, err := baggage.NewMember("pod.name", pod.Name)
+	if err != nil {
+		klog.V(2).ErrorS(err, "new pod.name member error")
+		return baggage.Baggage{}
+	}
+	podNs, err := baggage.NewMember("pod.ns", pod.Namespace)
+	if err != nil {
+		klog.V(2).ErrorS(err, "new pod.ns member error")
+		return baggage.Baggage{}
+	}
+	containerName, err := baggage.NewMember("container.name", container.Name)
+	if err != nil {
+		klog.V(2).ErrorS(err, "new container.name member error")
+		return baggage.Baggage{}
+	}
+	b, err := baggage.New(podUID, podName, podNs, containerName)
+	if err != nil {
+		klog.V(2).ErrorS(err, "new baggage error")
+		return baggage.Baggage{}
+	}
+	return b
 }

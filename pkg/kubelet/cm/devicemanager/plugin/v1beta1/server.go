@@ -19,6 +19,7 @@ package v1beta1
 import (
 	"context"
 	"fmt"
+	"go.opentelemetry.io/otel/trace"
 	"net"
 	"os"
 	"path/filepath"
@@ -53,10 +54,11 @@ type server struct {
 	rhandler   RegistrationHandler
 	chandler   ClientHandler
 	clients    map[string]Client
+	tp         trace.TracerProvider
 }
 
 // NewServer returns an initialized device plugin registration server.
-func NewServer(socketPath string, rh RegistrationHandler, ch ClientHandler) (Server, error) {
+func NewServer(socketPath string, rh RegistrationHandler, ch ClientHandler, tp trace.TracerProvider) (Server, error) {
 	if socketPath == "" || !filepath.IsAbs(socketPath) {
 		return nil, fmt.Errorf(errBadSocket+" %s", socketPath)
 	}
@@ -70,6 +72,7 @@ func NewServer(socketPath string, rh RegistrationHandler, ch ClientHandler) (Ser
 		rhandler:   rh,
 		chandler:   ch,
 		clients:    make(map[string]Client),
+		tp:         tp,
 	}
 
 	return s, nil

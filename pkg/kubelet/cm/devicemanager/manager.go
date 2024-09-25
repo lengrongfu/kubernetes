@@ -20,6 +20,7 @@ import (
 	"context"
 	goerrors "errors"
 	"fmt"
+	"go.opentelemetry.io/otel/trace"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -28,6 +29,7 @@ import (
 	"time"
 
 	cadvisorapi "github.com/google/cadvisor/info/v1"
+	"go.opentelemetry.io/otel/baggage"
 	"k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
@@ -131,15 +133,15 @@ func (s *sourcesReadyStub) AddSource(source string) {}
 func (s *sourcesReadyStub) AllReady() bool          { return true }
 
 // NewManagerImpl creates a new manager.
-func NewManagerImpl(topology []cadvisorapi.Node, topologyAffinityStore topologymanager.Store) (*ManagerImpl, error) {
+func NewManagerImpl(topology []cadvisorapi.Node, topologyAffinityStore topologymanager.Store, tp trace.TracerProvider) (*ManagerImpl, error) {
 	socketPath := pluginapi.KubeletSocket
 	if runtime.GOOS == "windows" {
 		socketPath = os.Getenv("SYSTEMDRIVE") + pluginapi.KubeletSocketWindows
 	}
-	return newManagerImpl(socketPath, topology, topologyAffinityStore)
+	return newManagerImpl(socketPath, topology, topologyAffinityStore, tp)
 }
 
-func newManagerImpl(socketPath string, topology []cadvisorapi.Node, topologyAffinityStore topologymanager.Store) (*ManagerImpl, error) {
+func newManagerImpl(socketPath string, topology []cadvisorapi.Node, topologyAffinityStore topologymanager.Store, tp trace.TracerProvider) (*ManagerImpl, error) {
 	klog.V(2).InfoS("Creating Device Plugin manager", "path", socketPath)
 
 	var numaNodes []int
@@ -161,7 +163,7 @@ func newManagerImpl(socketPath string, topology []cadvisorapi.Node, topologyAffi
 		update:                make(chan resourceupdates.Update, 100),
 	}
 
-	server, err := plugin.NewServer(socketPath, manager, manager)
+	server, err := plugin.NewServer(socketPath, manager, manager, tp)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create plugin server: %v", err)
 	}
@@ -363,7 +365,7 @@ func (m *ManagerImpl) Stop() error {
 
 // Allocate is the call that you can use to allocate a set of devices
 // from the registered device plugins.
-func (m *ManagerImpl) Allocate(pod *v1.Pod, container *v1.Container) error {
+func (m *ManagerImpl) Allocate(ctx context.Context, pod *v1.Pod, container *v1.Container) error {
 	// The pod is during the admission phase. We need to save the pod to avoid it
 	// being cleaned before the admission ended
 	m.setPodPendingAdmission(pod)
@@ -382,7 +384,7 @@ func (m *ManagerImpl) Allocate(pod *v1.Pod, container *v1.Container) error {
 	// ever change those semantics, this logic will need to be amended.
 	for _, initContainer := range pod.Spec.InitContainers {
 		if container.Name == initContainer.Name {
-			if err := m.allocateContainerResources(pod, container, m.devicesToReuse[string(pod.UID)]); err != nil {
+			if err := m.allocateContainerResources(ctx, pod, container, m.devicesToReuse[string(pod.UID)]); err != nil {
 				return err
 			}
 			if !types.IsRestartableInitContainer(&initContainer) {
@@ -396,7 +398,7 @@ func (m *ManagerImpl) Allocate(pod *v1.Pod, container *v1.Container) error {
 			return nil
 		}
 	}
-	if err := m.allocateContainerResources(pod, container, m.devicesToReuse[string(pod.UID)]); err != nil {
+	if err := m.allocateContainerResources(ctx, pod, container, m.devicesToReuse[string(pod.UID)]); err != nil {
 		return err
 	}
 	m.podDevices.removeContainerAllocatedResources(string(pod.UID), container.Name, m.devicesToReuse[string(pod.UID)])
@@ -575,7 +577,7 @@ func (m *ManagerImpl) UpdateAllocatedDevices() {
 
 // Returns list of device Ids we need to allocate with Allocate rpc call.
 // Returns empty list in case we don't need to issue the Allocate rpc call.
-func (m *ManagerImpl) devicesToAllocate(podUID, contName, resource string, required int, reusableDevices sets.Set[string]) (sets.Set[string], error) {
+func (m *ManagerImpl) devicesToAllocate(ctx context.Context, podUID, contName, resource string, required int, reusableDevices sets.Set[string]) (sets.Set[string], error) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	needed := required
@@ -684,7 +686,7 @@ func (m *ManagerImpl) devicesToAllocate(podUID, contName, resource string, requi
 	// give the plugin the chance to influence which ones to allocate from that set.
 	if needed < aligned.Len() {
 		// First allocate from the preferred devices list (if available).
-		preferred, err := m.callGetPreferredAllocationIfAvailable(podUID, contName, resource, aligned.Union(allocated), allocated, required)
+		preferred, err := m.callGetPreferredAllocationIfAvailable(ctx, podUID, contName, resource, aligned.Union(allocated), allocated, required)
 		if err != nil {
 			return nil, err
 		}
@@ -709,7 +711,7 @@ func (m *ManagerImpl) devicesToAllocate(podUID, contName, resource string, requi
 
 	// Then give the plugin the chance to influence the decision on any
 	// remaining devices to allocate.
-	preferred, err := m.callGetPreferredAllocationIfAvailable(podUID, contName, resource, available.Union(allocated), allocated, required)
+	preferred, err := m.callGetPreferredAllocationIfAvailable(ctx, podUID, contName, resource, available.Union(allocated), allocated, required)
 	if err != nil {
 		return nil, err
 	}
@@ -831,7 +833,7 @@ func (m *ManagerImpl) filterByAffinity(podUID, contName, resource string, availa
 // plugin resources for the input container, issues an Allocate rpc request
 // for each new device resource requirement, processes their AllocateResponses,
 // and updates the cached containerDevices on success.
-func (m *ManagerImpl) allocateContainerResources(pod *v1.Pod, container *v1.Container, devicesToReuse map[string]sets.Set[string]) error {
+func (m *ManagerImpl) allocateContainerResources(ctx context.Context, pod *v1.Pod, container *v1.Container, devicesToReuse map[string]sets.Set[string]) error {
 	podUID := string(pod.UID)
 	contName := container.Name
 	allocatedDevicesUpdated := false
@@ -853,7 +855,7 @@ func (m *ManagerImpl) allocateContainerResources(pod *v1.Pod, container *v1.Cont
 			m.UpdateAllocatedDevices()
 			allocatedDevicesUpdated = true
 		}
-		allocDevices, err := m.devicesToAllocate(podUID, contName, resource, needed, devicesToReuse[resource])
+		allocDevices, err := m.devicesToAllocate(ctx, podUID, contName, resource, needed, devicesToReuse[resource])
 		if err != nil {
 			return err
 		}
@@ -890,7 +892,7 @@ func (m *ManagerImpl) allocateContainerResources(pod *v1.Pod, container *v1.Cont
 		// TODO: refactor this part of code to just append a ContainerAllocationRequest
 		// in a passed in AllocateRequest pointer, and issues a single Allocate call per pod.
 		klog.V(3).InfoS("Making allocation request for device plugin", "devices", devs, "resourceName", resource)
-		resp, err := eI.e.allocate(devs)
+		resp, err := eI.e.allocate(ctx, devs)
 		metrics.DevicePluginAllocationDuration.WithLabelValues(resource).Observe(metrics.SinceInSeconds(startRPCTime))
 		if err != nil {
 			// In case of allocation failure, we want to restore m.allocatedDevices
@@ -944,7 +946,11 @@ func (m *ManagerImpl) checkPodActive(pod *v1.Pod) bool {
 // GetDeviceRunContainerOptions checks whether we have cached containerDevices
 // for the passed-in <pod, container> and returns its DeviceRunContainerOptions
 // for the found one. An empty struct is returned in case no cached state is found.
-func (m *ManagerImpl) GetDeviceRunContainerOptions(pod *v1.Pod, container *v1.Container) (*DeviceRunContainerOptions, error) {
+func (m *ManagerImpl) GetDeviceRunContainerOptions(ctx context.Context, pod *v1.Pod, container *v1.Container) (*DeviceRunContainerOptions, error) {
+	bag := m.generateBaggage(pod, container)
+	klog.V(2).InfoS("generate baggage info is: %s", bag.String())
+	ctx = baggage.ContextWithBaggage(ctx, bag)
+
 	podUID := string(pod.UID)
 	contName := container.Name
 	needsReAllocate := false
@@ -953,7 +959,7 @@ func (m *ManagerImpl) GetDeviceRunContainerOptions(pod *v1.Pod, container *v1.Co
 		if !m.isDevicePluginResource(resource) || v.Value() == 0 {
 			continue
 		}
-		err := m.callPreStartContainerIfNeeded(podUID, contName, resource)
+		err := m.callPreStartContainerIfNeeded(ctx, podUID, contName, resource)
 		if err != nil {
 			return nil, err
 		}
@@ -972,7 +978,7 @@ func (m *ManagerImpl) GetDeviceRunContainerOptions(pod *v1.Pod, container *v1.Co
 	}
 	if needsReAllocate {
 		klog.V(2).InfoS("Needs to re-allocate device plugin resources for pod", "pod", klog.KObj(pod), "containerName", container.Name)
-		if err := m.Allocate(pod, container); err != nil {
+		if err := m.Allocate(ctx, pod, container); err != nil {
 			return nil, err
 		}
 	}
@@ -981,7 +987,7 @@ func (m *ManagerImpl) GetDeviceRunContainerOptions(pod *v1.Pod, container *v1.Co
 
 // callPreStartContainerIfNeeded issues PreStartContainer grpc call for device plugin resource
 // with PreStartRequired option set.
-func (m *ManagerImpl) callPreStartContainerIfNeeded(podUID, contName, resource string) error {
+func (m *ManagerImpl) callPreStartContainerIfNeeded(ctx context.Context, podUID, contName, resource string) error {
 	m.mutex.Lock()
 	eI, ok := m.endpoints[resource]
 	if !ok {
@@ -1004,7 +1010,7 @@ func (m *ManagerImpl) callPreStartContainerIfNeeded(podUID, contName, resource s
 	m.mutex.Unlock()
 	devs := devices.UnsortedList()
 	klog.V(4).InfoS("Issuing a PreStartContainer call for container", "containerName", contName, "podUID", podUID)
-	_, err := eI.e.preStartContainer(devs)
+	_, err := eI.e.preStartContainer(ctx, devs)
 	if err != nil {
 		return fmt.Errorf("device plugin PreStartContainer rpc failed with err: %v", err)
 	}
@@ -1014,7 +1020,7 @@ func (m *ManagerImpl) callPreStartContainerIfNeeded(podUID, contName, resource s
 
 // callGetPreferredAllocationIfAvailable issues GetPreferredAllocation grpc
 // call for device plugin resource with GetPreferredAllocationAvailable option set.
-func (m *ManagerImpl) callGetPreferredAllocationIfAvailable(podUID, contName, resource string, available, mustInclude sets.Set[string], size int) (sets.Set[string], error) {
+func (m *ManagerImpl) callGetPreferredAllocationIfAvailable(ctx context.Context, podUID, contName, resource string, available, mustInclude sets.Set[string], size int) (sets.Set[string], error) {
 	eI, ok := m.endpoints[resource]
 	if !ok {
 		return nil, fmt.Errorf("endpoint not found in cache for a registered resource: %s", resource)
@@ -1027,7 +1033,7 @@ func (m *ManagerImpl) callGetPreferredAllocationIfAvailable(podUID, contName, re
 
 	m.mutex.Unlock()
 	klog.V(4).InfoS("Issuing a GetPreferredAllocation call for container", "containerName", contName, "podUID", podUID)
-	resp, err := eI.e.getPreferredAllocation(available.UnsortedList(), mustInclude.UnsortedList(), size)
+	resp, err := eI.e.getPreferredAllocation(ctx, available.UnsortedList(), mustInclude.UnsortedList(), size)
 	m.mutex.Lock()
 	if err != nil {
 		return nil, fmt.Errorf("device plugin GetPreferredAllocation rpc failed with err: %v", err)
@@ -1196,4 +1202,33 @@ func (m *ManagerImpl) isContainerAlreadyRunning(podUID, cntName string) bool {
 	// Once we make it here we know we have a running container.
 	klog.V(4).InfoS("container found in the initial set, assumed running", "podUID", podUID, "containerName", cntName, "containerID", cntID)
 	return true
+}
+
+func (m *ManagerImpl) generateBaggage(pod *v1.Pod, container *v1.Container) baggage.Baggage {
+	podUID, err := baggage.NewMember("pod.uid", string(pod.UID))
+	if err != nil {
+		klog.V(2).ErrorS(err, "new pod.uid member error")
+		return baggage.Baggage{}
+	}
+	podName, err := baggage.NewMember("pod.name", pod.Name)
+	if err != nil {
+		klog.V(2).ErrorS(err, "new pod.name member error")
+		return baggage.Baggage{}
+	}
+	podNs, err := baggage.NewMember("pod.ns", pod.Namespace)
+	if err != nil {
+		klog.V(2).ErrorS(err, "new pod.ns member error")
+		return baggage.Baggage{}
+	}
+	containerName, err := baggage.NewMember("container.name", container.Name)
+	if err != nil {
+		klog.V(2).ErrorS(err, "new container.name member error")
+		return baggage.Baggage{}
+	}
+	b, err := baggage.New(podUID, podName, podNs, containerName)
+	if err != nil {
+		klog.V(2).ErrorS(err, "new baggage error")
+		return baggage.Baggage{}
+	}
+	return b
 }

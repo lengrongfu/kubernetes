@@ -18,6 +18,7 @@ package tracing
 
 import (
 	"context"
+	"go.opentelemetry.io/otel"
 	"net/http"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -88,6 +89,8 @@ func NewProvider(ctx context.Context,
 		sdktrace.WithSpanProcessor(bsp),
 		sdktrace.WithResource(res),
 	)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 	return tp, nil
 }
 

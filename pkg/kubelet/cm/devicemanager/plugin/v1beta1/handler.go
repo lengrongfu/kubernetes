@@ -66,7 +66,7 @@ func (s *server) ValidatePlugin(pluginName string, endpoint string, versions []s
 }
 
 func (s *server) connectClient(name string, socketPath string) error {
-	c := NewPluginClient(name, socketPath, s.chandler)
+	c := NewPluginClient(name, socketPath, s.chandler, s.tp)
 
 	s.registerClient(name, c)
 	if err := c.Connect(); err != nil {
