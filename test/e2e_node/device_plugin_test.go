@@ -610,7 +610,7 @@ func testDevicePlugin(f *framework.Framework, pluginSockDir string) {
 			}, 30*time.Second, framework.Poll).ShouldNot(gomega.HaveOccurred(), "cannot fetch the compute resource assignment after kubelet restart")
 
 			err, _ = checkPodResourcesAssignment(v1PodResources, pod1.Namespace, pod1.Name, pod1.Spec.Containers[0].Name, SampleDeviceResourceName, []string{devID1})
-			framework.ExpectNoError(err, "inconsistent device assignment after pod restart")
+			framework.ExpectNoError(err, fmt.Sprintf("inconsistent device assignment after pod restart, v1PodResources is: %+v, pod1 is: %+v", v1PodResources, pod1))
 
 			ginkgo.By("Re-Register resources by deleting the plugin pod")
 			gp := int64(0)
